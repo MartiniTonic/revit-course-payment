@@ -1,24 +1,11 @@
-const express = require("express");
-const crypto = require("crypto");
-const https = require("https");
-
-const app = express();
-
-app.use(express.json());
-
 /*
  * ==========================================
- * НАСТРОЙКИ
+ * REVIT COURSE PAYMENT
+ * Cloudflare Worker + T-Bank
  * ==========================================
  */
 
-const PORT = process.env.PORT || 3000;
-
 const TBANK_URL = "https://securepay.tinkoff.ru/v2/Init";
-
-const TERMINAL_KEY = process.env.TBANK_TERMINAL_KEY;
-const PASSWORD = process.env.TBANK_PASSWORD;
-
 
 /*
  * ==========================================
@@ -26,31 +13,63 @@ const PASSWORD = process.env.TBANK_PASSWORD;
  * ==========================================
  */
 
-app.use((req, res, next) => {
-  res.header("Access-Control-Allow-Origin", "*");
-  res.header("Access-Control-Allow-Headers", "Content-Type");
-  res.header("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+function corsHeaders() {
+  return {
+    "Access-Control-Allow-Origin": "*",
+    "Access-Control-Allow-Headers": "Content-Type",
+    "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+    "Content-Type": "application/json; charset=UTF-8",
+  };
+}
 
-  if (req.method === "OPTIONS") {
-    return res.sendStatus(204);
-  }
+function jsonResponse(data, status = 200) {
+  return new Response(JSON.stringify(data), {
+    status,
+    headers: corsHeaders(),
+  });
+}
 
-  next();
-});
+/*
+ * ==========================================
+ * SHA-256
+ * ==========================================
+ */
 
+async function sha256(text) {
+  const data = new TextEncoder().encode(text);
+
+  const hashBuffer = await crypto.subtle.digest(
+    "SHA-256",
+    data
+  );
+
+  const hashArray = Array.from(
+    new Uint8Array(hashBuffer)
+  );
+
+  return hashArray
+    .map(byte => byte.toString(16).padStart(2, "0"))
+    .join("");
+}
 
 /*
  * ==========================================
  * ГЕНЕРАЦИЯ TOKEN ДЛЯ Т-БАНКА
  * ==========================================
+ *
+ * В Token участвуют только параметры
+ * верхнего уровня.
+ *
+ * Вложенные объекты и массивы
+ * не участвуют.
+ *
+ * Password добавляется отдельно.
  */
 
-function generateToken(params) {
+async function generateToken(params, password) {
   const tokenParams = [];
 
   for (const [key, value] of Object.entries(params)) {
-    // В Token участвуют только параметры
-    // верхнего уровня.
     if (
       value !== null &&
       value !== undefined &&
@@ -59,346 +78,389 @@ function generateToken(params) {
     ) {
       tokenParams.push({
         key,
-        value: String(value)
+        value: String(value),
       });
     }
   }
 
-  // Добавляем пароль терминала
   tokenParams.push({
     key: "Password",
-    value: PASSWORD
+    value: password,
   });
 
-  // Сортировка по ключу
-  tokenParams.sort((a, b) => a.key.localeCompare(b.key));
+  tokenParams.sort((a, b) =>
+    a.key.localeCompare(b.key)
+  );
 
-  // Склеиваем только значения
   const stringToHash = tokenParams
     .map(item => item.value)
     .join("");
 
-  // SHA-256
-  return crypto
-    .createHash("sha256")
-    .update(stringToHash, "utf8")
-    .digest("hex");
+  return await sha256(stringToHash);
 }
 
-
 /*
  * ==========================================
- * HTTPS ЗАПРОС К Т-БАНКУ
+ * УНИКАЛЬНЫЙ ORDER ID
  * ==========================================
  */
 
-function requestToTBank(data) {
-  return new Promise((resolve, reject) => {
+function createOrderId() {
+  const randomPart = crypto.randomUUID()
+    .replace(/-/g, "")
+    .slice(0, 8);
 
-    const url = new URL(TBANK_URL);
-
-    const postData = JSON.stringify(data);
-
-    const options = {
-      hostname: url.hostname,
-      port: 443,
-      path: url.pathname,
-      method: "POST",
-
-      headers: {
-        "Content-Type": "application/json",
-        "Content-Length": Buffer.byteLength(postData)
-      },
-
-      /*
-       * Используем российские доверенные
-       * сертификаты, которые мы добавили
-       * в переменные окружения.
-       */
-
-      ca: [
-        process.env.RUSSIAN_TRUSTED_ROOT_CA,
-        process.env.RUSSIAN_TRUSTED_SUB_CA
-      ]
-        .filter(Boolean)
-        .join("\n")
-    };
-
-
-    const request = https.request(options, (response) => {
-
-      let body = "";
-
-      response.setEncoding("utf8");
-
-      response.on("data", chunk => {
-        body += chunk;
-      });
-
-      response.on("end", () => {
-
-        let parsed;
-
-        try {
-          parsed = JSON.parse(body);
-        } catch {
-          parsed = {
-            raw: body
-          };
-        }
-
-        resolve({
-          statusCode: response.statusCode,
-          body: parsed
-        });
-      });
-    });
-
-
-    request.on("error", error => {
-      reject(error);
-    });
-
-
-    request.write(postData);
-    request.end();
-  });
+  return `REVIT-${Date.now()}-${randomPart}`;
 }
 
-
 /*
  * ==========================================
- * ПРОВЕРКА СЕРВЕРА
+ * ЗАПРОС К Т-БАНКУ
  * ==========================================
  */
 
-app.get("/", (req, res) => {
-  res.json({
-    success: true,
-    service: "revit-course-payment",
-    status: "online"
+async function requestToTBank(data) {
+  const response = await fetch(TBANK_URL, {
+    method: "POST",
+
+    headers: {
+      "Content-Type": "application/json",
+    },
+
+    body: JSON.stringify(data),
   });
-});
 
+  const text = await response.text();
 
-/*
- * ==========================================
- * СОЗДАНИЕ ПЛАТЕЖА
- * ==========================================
- *
- * POST /create-payment
- *
- * Framer отправляет:
- *
- * {
- *   "amount": 150000,
- *   "description": "Курс Revit"
- * }
- *
- * amount указывается в рублях.
- *
- * Например:
- *
- * 150000 = 150 000 ₽
- *
- */
-
-
-app.post("/create-payment", async (req, res) => {
+  let body;
 
   try {
-
-    if (!TERMINAL_KEY) {
-      return res.status(500).json({
-        success: false,
-        error: "TBANK_TERMINAL_KEY is not configured"
-      });
-    }
-
-    if (!PASSWORD) {
-      return res.status(500).json({
-        success: false,
-        error: "TBANK_PASSWORD is not configured"
-      });
-    }
-
-
-    /*
-     * Получаем данные от Framer
-     */
-
-    const amountRubles = Number(req.body.amount);
-
-    const description =
-      req.body.description ||
-      "Оплата курса Revit";
-
-
-    /*
-     * Проверяем сумму
-     */
-
-    if (!Number.isFinite(amountRubles) || amountRubles <= 0) {
-      return res.status(400).json({
-        success: false,
-        error: "Некорректная сумма"
-      });
-    }
-
-
-    /*
-     * Перевод рублей в копейки
-     */
-
-    const amount = Math.round(amountRubles * 100);
-
-
-    /*
-     * Создаем уникальный OrderId
-     */
-
-    const orderId =
-      "REVIT-" +
-      Date.now() +
-      "-" +
-      crypto.randomBytes(4).toString("hex");
-
-
-    /*
-     * Формируем запрос Т-Банку
-     */
-
-    const paymentRequest = {
-
-      TerminalKey: TERMINAL_KEY,
-
-      Amount: amount,
-
-      OrderId: orderId,
-
-      Description: description,
-
-      Language: "ru",
-
-      PayType: "O"
-
+    body = JSON.parse(text);
+  } catch {
+    body = {
+      raw: text,
     };
+  }
 
+  return {
+    statusCode: response.status,
+    body,
+  };
+}
+
+/*
+ * ==========================================
+ * CLOUDFLARE WORKER
+ * ==========================================
+ */
+
+export default {
+  async fetch(request, env) {
 
     /*
-     * Формируем Token
+     * ========================================
+     * OPTIONS / CORS
+     * ========================================
      */
 
-    paymentRequest.Token =
-      generateToken(paymentRequest);
+    if (request.method === "OPTIONS") {
+      return new Response(null, {
+        status: 204,
+        headers: corsHeaders(),
+      });
+    }
 
-
-    /*
-     * Отправляем запрос Т-Банку
-     */
-
-    const result =
-      await requestToTBank(paymentRequest);
-
+    const url = new URL(request.url);
 
     /*
-     * Если Т-Банк вернул ошибку
+     * ========================================
+     * ПРОВЕРКА СЕРВЕРА
+     * GET /
+     * ========================================
      */
 
     if (
-      result.statusCode < 200 ||
-      result.statusCode >= 300
+      request.method === "GET" &&
+      url.pathname === "/"
+    ) {
+      return jsonResponse({
+        success: true,
+        service: "revit-course-payment",
+        status: "online",
+      });
+    }
+
+    /*
+     * ========================================
+     * СОЗДАНИЕ ПЛАТЕЖА
+     * POST /create-payment
+     * ========================================
+     *
+     * Framer отправляет:
+     *
+     * {
+     *   "amount": 150000,
+     *   "description": "Курс Revit"
+     * }
+     *
+     * amount указывается в рублях.
+     */
+
+    if (
+      request.method === "POST" &&
+      url.pathname === "/create-payment"
     ) {
 
-      console.error(
-        "T-Bank HTTP error:",
-        result.statusCode,
-        result.body
-      );
+      try {
 
-      return res.status(502).json({
-        success: false,
-        error: "T-Bank API error",
-        details: result.body
-      });
+        /*
+         * Получаем секреты
+         * из Cloudflare Environment
+         */
+
+        const TERMINAL_KEY =
+          env.TBANK_TERMINAL_KEY;
+
+        const PASSWORD =
+          env.TBANK_PASSWORD;
+
+        /*
+         * Проверяем наличие секретов
+         */
+
+        if (!TERMINAL_KEY) {
+          return jsonResponse(
+            {
+              success: false,
+              error:
+                "TBANK_TERMINAL_KEY is not configured",
+            },
+            500
+          );
+        }
+
+        if (!PASSWORD) {
+          return jsonResponse(
+            {
+              success: false,
+              error:
+                "TBANK_PASSWORD is not configured",
+            },
+            500
+          );
+        }
+
+        /*
+         * Читаем JSON от Framer
+         */
+
+        let body;
+
+        try {
+          body = await request.json();
+        } catch {
+          return jsonResponse(
+            {
+              success: false,
+              error: "Некорректный JSON",
+            },
+            400
+          );
+        }
+
+        /*
+         * Получаем сумму
+         */
+
+        const amountRubles =
+          Number(body.amount);
+
+        const description =
+          body.description ||
+          "Оплата курса Revit";
+
+        /*
+         * Проверяем сумму
+         */
+
+        if (
+          !Number.isFinite(amountRubles) ||
+          amountRubles <= 0
+        ) {
+          return jsonResponse(
+            {
+              success: false,
+              error: "Некорректная сумма",
+            },
+            400
+          );
+        }
+
+        /*
+         * Переводим рубли в копейки
+         */
+
+        const amount =
+          Math.round(amountRubles * 100);
+
+        /*
+         * Создаем OrderId
+         */
+
+        const orderId =
+          createOrderId();
+
+        /*
+         * Формируем запрос Т-Банку
+         */
+
+        const paymentRequest = {
+          TerminalKey:
+            TERMINAL_KEY,
+
+          Amount:
+            amount,
+
+          OrderId:
+            orderId,
+
+          Description:
+            description,
+
+          Language:
+            "ru",
+
+          PayType:
+            "O",
+        };
+
+        /*
+         * Создаем Token
+         */
+
+        paymentRequest.Token =
+          await generateToken(
+            paymentRequest,
+            PASSWORD
+          );
+
+        /*
+         * Отправляем запрос
+         * в Т-Банк
+         */
+
+        const result =
+          await requestToTBank(
+            paymentRequest
+          );
+
+        /*
+         * Проверяем HTTP-ответ
+         */
+
+        if (
+          result.statusCode < 200 ||
+          result.statusCode >= 300
+        ) {
+
+          console.error(
+            "T-Bank HTTP error:",
+            result.statusCode,
+            result.body
+          );
+
+          return jsonResponse(
+            {
+              success: false,
+              error: "T-Bank API error",
+              details: result.body,
+            },
+            502
+          );
+        }
+
+        /*
+         * Проверяем ответ Т-Банка
+         */
+
+        if (!result.body.Success) {
+
+          console.error(
+            "T-Bank payment error:",
+            result.body
+          );
+
+          return jsonResponse(
+            {
+              success: false,
+
+              error:
+                result.body.Message ||
+                result.body.Details ||
+                "Т-Банк не создал платеж",
+
+              tbank:
+                result.body,
+            },
+            400
+          );
+        }
+
+        /*
+         * УСПЕШНО
+         *
+         * Возвращаем Framer
+         * ссылку PaymentURL
+         */
+
+        return jsonResponse({
+          success: true,
+
+          paymentId:
+            result.body.PaymentId,
+
+          orderId:
+            result.body.OrderId,
+
+          paymentUrl:
+            result.body.PaymentURL,
+        });
+
+      } catch (error) {
+
+        console.error(
+          "Server error:",
+          error
+        );
+
+        return jsonResponse(
+          {
+            success: false,
+
+            error:
+              "Внутренняя ошибка сервера",
+
+            details:
+              error?.message ||
+              String(error),
+          },
+          500
+        );
+      }
     }
 
-
     /*
-     * Проверяем ответ Т-Банка
+     * ========================================
+     * НЕИЗВЕСТНЫЙ URL
+     * ========================================
      */
 
-    if (!result.body.Success) {
-
-      console.error(
-        "T-Bank payment error:",
-        result.body
-      );
-
-      return res.status(400).json({
+    return jsonResponse(
+      {
         success: false,
-        error:
-          result.body.Message ||
-          result.body.Details ||
-          "Т-Банк не создал платеж",
-        tbank: result.body
-      });
-    }
-
-
-    /*
-     * Успешно.
-     *
-     * PaymentURL — ссылка,
-     * на которую нужно отправить покупателя.
-     */
-
-    return res.json({
-
-      success: true,
-
-      paymentId:
-        result.body.PaymentId,
-
-      orderId:
-        result.body.OrderId,
-
-      paymentUrl:
-        result.body.PaymentURL
-    });
-
-
-  } catch (error) {
-
-    console.error(
-      "Server error:",
-      error
+        error: "Not found",
+      },
+      404
     );
-
-    return res.status(500).json({
-
-      success: false,
-
-      error:
-        "Внутренняя ошибка сервера",
-
-      details:
-        error.message
-    });
-  }
-});
-
-
-/*
- * ==========================================
- * ЗАПУСК
- * ==========================================
- */
-
-app.listen(PORT, () => {
-
-  console.log(
-    `Payment server started on port ${PORT}`
-  );
-
-});
+  },
+};
