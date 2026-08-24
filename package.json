@@ -1,0 +1,15 @@
+{
+  "name": "revit-course-payment",
+  "version": "1.0.0",
+  "description": "Payment proxy for T-Bank acquiring",
+  "main": "worker.js",
+  "scripts": {
+    "start": "node worker.js"
+  },
+  "dependencies": {
+    "express": "^4.21.2"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
