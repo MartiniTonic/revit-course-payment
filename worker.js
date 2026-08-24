@@ -5,7 +5,7 @@
  * ==========================================
  */
 
-const TBANK_URL = "https://rest-api-test.tinkoff.ru/v2/Init";
+const TBANK_URL = "https://securepay.tinkoff.ru/v2/Init";
 
 /*
  * ==========================================
