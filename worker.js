@@ -5,7 +5,7 @@
  * ==========================================
  */
 
-const TBANK_URL = "https://securepay.tinkoff.ru/v2/Init";
+const TBANK_URL = "https://rest-api-test.tinkoff.ru/v2/Init";
 
 /*
  * ==========================================
@@ -54,22 +54,15 @@ async function sha256(text) {
 
 /*
  * ==========================================
- * ГЕНЕРАЦИЯ TOKEN ДЛЯ Т-БАНКА
+ * T-BANK TOKEN
  * ==========================================
- *
- * В Token участвуют только параметры
- * верхнего уровня.
- *
- * Вложенные объекты и массивы
- * не участвуют.
- *
- * Password добавляется отдельно.
  */
 
 async function generateToken(params, password) {
   const tokenParams = [];
 
   for (const [key, value] of Object.entries(params)) {
+
     if (
       value !== null &&
       value !== undefined &&
@@ -96,56 +89,23 @@ async function generateToken(params, password) {
     .map(item => item.value)
     .join("");
 
-  return await sha256(stringToHash);
+  return sha256(stringToHash);
 }
 
 /*
  * ==========================================
- * УНИКАЛЬНЫЙ ORDER ID
+ * ORDER ID
  * ==========================================
  */
 
 function createOrderId() {
-  const randomPart = crypto.randomUUID()
+
+  const randomPart = crypto
+    .randomUUID()
     .replace(/-/g, "")
     .slice(0, 8);
 
   return `REVIT-${Date.now()}-${randomPart}`;
-}
-
-/*
- * ==========================================
- * ЗАПРОС К Т-БАНКУ
- * ==========================================
- */
-
-async function requestToTBank(data) {
-  const response = await fetch(TBANK_URL, {
-    method: "POST",
-
-    headers: {
-      "Content-Type": "application/json",
-    },
-
-    body: JSON.stringify(data),
-  });
-
-  const text = await response.text();
-
-  let body;
-
-  try {
-    body = JSON.parse(text);
-  } catch {
-    body = {
-      raw: text,
-    };
-  }
-
-  return {
-    statusCode: response.status,
-    body,
-  };
 }
 
 /*
@@ -155,27 +115,27 @@ async function requestToTBank(data) {
  */
 
 export default {
+
   async fetch(request, env) {
 
     /*
-     * ========================================
-     * OPTIONS / CORS
-     * ========================================
+     * CORS
      */
 
     if (request.method === "OPTIONS") {
+
       return new Response(null, {
         status: 204,
         headers: corsHeaders(),
       });
+
     }
 
     const url = new URL(request.url);
 
     /*
      * ========================================
-     * ПРОВЕРКА СЕРВЕРА
-     * GET /
+     * SERVER STATUS
      * ========================================
      */
 
@@ -183,27 +143,20 @@ export default {
       request.method === "GET" &&
       url.pathname === "/"
     ) {
+
       return jsonResponse({
         success: true,
         service: "revit-course-payment",
         status: "online",
+        environment: "test",
       });
+
     }
 
     /*
      * ========================================
-     * СОЗДАНИЕ ПЛАТЕЖА
-     * POST /create-payment
+     * CREATE PAYMENT
      * ========================================
-     *
-     * Framer отправляет:
-     *
-     * {
-     *   "amount": 150000,
-     *   "description": "Курс Revit"
-     * }
-     *
-     * amount указывается в рублях.
      */
 
     if (
@@ -213,11 +166,6 @@ export default {
 
       try {
 
-        /*
-         * Получаем секреты
-         * из Cloudflare Environment
-         */
-
         const TERMINAL_KEY =
           env.TBANK_TERMINAL_KEY;
 
@@ -225,96 +173,79 @@ export default {
           env.TBANK_PASSWORD;
 
         /*
-         * Проверяем наличие секретов
+         * Проверяем секреты
          */
 
         if (!TERMINAL_KEY) {
-          return jsonResponse(
-            {
-              success: false,
-              error:
-                "TBANK_TERMINAL_KEY is not configured",
-            },
-            500
-          );
+
+          return jsonResponse({
+            success: false,
+            error: "TBANK_TERMINAL_KEY is not configured",
+          }, 500);
+
         }
 
         if (!PASSWORD) {
-          return jsonResponse(
-            {
-              success: false,
-              error:
-                "TBANK_PASSWORD is not configured",
-            },
-            500
-          );
+
+          return jsonResponse({
+            success: false,
+            error: "TBANK_PASSWORD is not configured",
+          }, 500);
+
         }
 
         /*
-         * Читаем JSON от Framer
+         * Получаем JSON
          */
 
         let body;
 
         try {
+
           body = await request.json();
+
         } catch {
-          return jsonResponse(
-            {
-              success: false,
-              error: "Некорректный JSON",
-            },
-            400
-          );
+
+          return jsonResponse({
+            success: false,
+            error: "Некорректный JSON",
+          }, 400);
+
         }
 
         /*
-         * Получаем сумму
+         * ====================================
+         * ФИКСИРОВАННАЯ ЦЕНА КУРСА
+         * ====================================
+         *
+         * Сейчас намеренно фиксируем:
+         * 30 000 рублей.
+         *
+         * Framer не сможет изменить сумму.
          */
 
-        const amountRubles =
-          Number(body.amount);
+        const amountRubles = 30000;
+
+        const amount = 3000000;
 
         const description =
-          body.description ||
-          "Оплата курса Revit";
+          "Курс Revit — 30 000 ₽";
 
         /*
-         * Проверяем сумму
-         */
-
-        if (
-          !Number.isFinite(amountRubles) ||
-          amountRubles <= 0
-        ) {
-          return jsonResponse(
-            {
-              success: false,
-              error: "Некорректная сумма",
-            },
-            400
-          );
-        }
-
-        /*
-         * Переводим рубли в копейки
-         */
-
-        const amount =
-          Math.round(amountRubles * 100);
-
-        /*
-         * Создаем OrderId
+         * OrderId
          */
 
         const orderId =
           createOrderId();
 
         /*
-         * Формируем запрос Т-Банку
+         * ====================================
+         * REQUEST TO T-BANK
+         * ====================================
          */
 
         const paymentRequest = {
+
           TerminalKey:
             TERMINAL_KEY,
 
@@ -332,10 +263,11 @@ export default {
 
           PayType:
             "O",
+
         };
 
         /*
-         * Создаем Token
+         * Token
          */
 
         paymentRequest.Token =
@@ -345,122 +277,170 @@ export default {
           );
 
         /*
-         * Отправляем запрос
-         * в Т-Банк
+         * ====================================
+         * SEND TO T-BANK
+         * ====================================
          */
 
-        const result =
-          await requestToTBank(
-            paymentRequest
-          );
+        const response = await fetch(
+          TBANK_URL,
+          {
+            method: "POST",
 
-        /*
-         * Проверяем HTTP-ответ
-         */
-
-        if (
-          result.statusCode < 200 ||
-          result.statusCode >= 300
-        ) {
-
-          console.error(
-            "T-Bank HTTP error:",
-            result.statusCode,
-            result.body
-          );
-
-          return jsonResponse(
-            {
-              success: false,
-              error: "T-Bank API error",
-              details: result.body,
+            headers: {
+              "Content-Type": "application/json",
+              "Accept": "application/json",
             },
-            502
-          );
+
+            body: JSON.stringify(
+              paymentRequest
+            ),
+
+            cache: "no-store",
+          }
+        );
+
+        const text =
+          await response.text();
+
+        let result;
+
+        try {
+
+          result = JSON.parse(text);
+
+        } catch {
+
+          result = {
+            raw: text,
+          };
+
         }
 
         /*
-         * Проверяем ответ Т-Банка
+         * ====================================
+         * LOG
+         * ====================================
          */
 
-        if (!result.body.Success) {
+        console.log(
+          "T-Bank HTTP status:",
+          response.status
+        );
 
-          console.error(
-            "T-Bank payment error:",
-            result.body
-          );
+        console.log(
+          "T-Bank response:",
+          result
+        );
 
-          return jsonResponse(
-            {
-              success: false,
+        /*
+         * ====================================
+         * HTTP ERROR
+         * ====================================
+         */
 
-              error:
-                result.body.Message ||
-                result.body.Details ||
-                "Т-Банк не создал платеж",
+        if (!response.ok) {
 
-              tbank:
-                result.body,
-            },
-            400
-          );
+          return jsonResponse({
+
+            success: false,
+
+            error:
+              "T-Bank HTTP error",
+
+            httpStatus:
+              response.status,
+
+            details:
+              result,
+
+          }, 502);
+
         }
 
         /*
-         * УСПЕШНО
-         *
-         * Возвращаем Framer
-         * ссылку PaymentURL
+         * ====================================
+         * T-BANK ERROR
+         * ====================================
+         */
+
+        if (!result.Success) {
+
+          return jsonResponse({
+
+            success: false,
+
+            error:
+              result.Message ||
+              result.Details ||
+              "T-Bank не создал платеж",
+
+            tbank:
+              result,
+
+          }, 400);
+
+        }
+
+        /*
+         * ====================================
+         * SUCCESS
+         * ====================================
          */
 
         return jsonResponse({
+
           success: true,
 
           paymentId:
-            result.body.PaymentId,
+            result.PaymentId,
 
           orderId:
-            result.body.OrderId,
+            result.OrderId,
 
           paymentUrl:
-            result.body.PaymentURL,
+            result.PaymentURL,
+
         });
 
       } catch (error) {
 
         console.error(
-          "Server error:",
+          "Worker error:",
           error
         );
 
-        return jsonResponse(
-          {
-            success: false,
+        return jsonResponse({
 
-            error:
-              "Внутренняя ошибка сервера",
+          success: false,
 
-            details:
-              error?.message ||
-              String(error),
-          },
-          500
-        );
+          error:
+            "Внутренняя ошибка сервера",
+
+          details:
+            error?.message ||
+            String(error),
+
+        }, 500);
+
       }
+
     }
 
     /*
      * ========================================
-     * НЕИЗВЕСТНЫЙ URL
+     * 404
      * ========================================
      */
 
-    return jsonResponse(
-      {
-        success: false,
-        error: "Not found",
-      },
-      404
-    );
+    return jsonResponse({
+
+      success: false,
+
+      error: "Not found",
+
+    }, 404);
+
   },
+
 };
